@@ -1,51 +1,103 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity,
   StyleSheet, Alert, ActivityIndicator,
-  ScrollView, Linking,
+  ScrollView, FlatList, Platform, PermissionsAndroid,
 } from 'react-native';
+import WifiManager from 'react-native-wifi-reborn';
 import { useAuth } from '../context/AuthContext';
 import { getDeviceInfo } from '../api/esp32Api';
-import { requestWifiPermissions } from '../utils/permissions';
 import colors from '../theme/colors';
 import typography from '../theme/typography';
 import { ESP32_HOTSPOT_PREFIX } from '../utils/constants';
 
 const STEPS = {
-  CONNECT_HOTSPOT: 1,
-  VERIFY_DEVICE:   2,
+  SCAN_DEVICES:  1,
+  VERIFY_DEVICE: 2,
 };
 
 export default function AddDeviceScreen({ navigation }) {
   const { user } = useAuth();
-  const [step, setStep]             = useState(STEPS.CONNECT_HOTSPOT);
-  const [loading, setLoading]       = useState(false);
-  const [deviceInfo, setDeviceInfo] = useState(null);
-  const [deviceName, setDeviceName] = useState('');
-  const [roomName, setRoomName]     = useState('');
+  const [step, setStep]               = useState(STEPS.SCAN_DEVICES);
+  const [scanning, setScanning]       = useState(false);
+  const [connecting, setConnecting]   = useState(false);
+  const [loadingInfo, setLoadingInfo] = useState(false);
+  const [wifiList, setWifiList]       = useState([]);
+  const [deviceInfo, setDeviceInfo]   = useState(null);
+  const [deviceName, setDeviceName]   = useState('');
+  const [roomName, setRoomName]       = useState('');
 
-  const handleFetchDeviceInfo = async () => {
-    const hasPermission = await requestWifiPermissions();
-    if (!hasPermission) return;
+  useEffect(() => {
+    requestPermissions();
+  }, []);
 
-    setLoading(true);
-    try {
-      const info = await getDeviceInfo();
-      setDeviceInfo(info);
-      setStep(STEPS.VERIFY_DEVICE);
-    } catch (error) {
-      Alert.alert(
-        'Connection Failed',
-        'Could not connect to ESP!\n\nPlease check:\n• Is your phone connected to SMART_LOCK_SETUP_xxxx WiFi?\n• Is ESP in setup mode?',
-      );
-    } finally {
-      setLoading(false);
+  // ─── Permissions ──────────────────────────────────────────────
+  const requestPermissions = async () => {
+    if (Platform.OS === 'android') {
+      try {
+        await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+          PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
+          PermissionsAndroid.PERMISSIONS.CHANGE_NETWORK_STATE,
+          PermissionsAndroid.PERMISSIONS.ACCESS_WIFI_STATE,
+        ]);
+      } catch (e) {
+        console.error('Permission error:', e);
+      }
     }
   };
 
+  // ─── WiFi Scan ────────────────────────────────────────────────
+  const handleScan = async () => {
+    setScanning(true);
+    setWifiList([]);
+    try {
+      const networks = await WifiManager.loadWifiList();
+      const filtered = networks.filter((n) =>
+        n.SSID && n.SSID.startsWith(ESP32_HOTSPOT_PREFIX)
+      );
+      if (filtered.length === 0) {
+        Alert.alert(
+          'No Device Found',
+          'SMART_LOCK_SETUP_ network nahi mila!\n\n• NodeMCU power on hai?\n• Pehli baar boot ho raha hai?'
+        );
+      }
+      setWifiList(filtered);
+    } catch (e) {
+      Alert.alert('Scan Failed', 'WiFi scan nahi ho paya: ' + e.message);
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  // ─── Connect to ESP Hotspot ───────────────────────────────────
+  const handleConnect = async (ssid) => {
+    setConnecting(true);
+    try {
+      await WifiManager.connectToProtectedSSID(ssid, '12345678', false, false);
+
+      // Connected — ab device info fetch karo
+      setLoadingInfo(true);
+      await new Promise((r) => setTimeout(r, 2000)); // 2 sec wait
+
+      const info = await getDeviceInfo();
+      setDeviceInfo(info);
+      setStep(STEPS.VERIFY_DEVICE);
+    } catch (e) {
+      Alert.alert(
+        'Connect Failed',
+        `${ssid} se connect nahi ho paya!\n\nManually WiFi settings mein connect karke try karo.`
+      );
+    } finally {
+      setConnecting(false);
+      setLoadingInfo(false);
+    }
+  };
+
+  // ─── Confirm Device ───────────────────────────────────────────
   const handleConfirmDevice = () => {
     if (!deviceName.trim()) {
-      Alert.alert('Error', 'Please enter device name!');
+      Alert.alert('Error', 'Device name bharo!');
       return;
     }
     navigation.navigate('WiFiSetup', {
@@ -55,48 +107,96 @@ export default function AddDeviceScreen({ navigation }) {
     });
   };
 
-  // ─── Step 1 UI ────────────────────────────────────────────────
+  // ─── Step 1 — Scan UI ─────────────────────────────────────────
   const renderStep1 = () => (
     <View style={styles.stepContainer}>
       <Text style={styles.stepIcon}>📡</Text>
-      <Text style={styles.stepTitle}>Connect to ESP Hotspot</Text>
+      <Text style={styles.stepTitle}>Find Smart Lock</Text>
       <Text style={styles.stepDesc}>
-        Go to your phone's WiFi settings and connect to{' '}
-        <Text style={styles.highlight}>{ESP32_HOTSPOT_PREFIX}xxxx</Text>{' '}
-        network.
+        NodeMCU power on karo — phir Scan dabao.{'\n'}
+        App automatically{' '}
+        <Text style={styles.highlight}>SMART_LOCK_SETUP_</Text>{' '}
+        networks dhundega.
       </Text>
 
-      <View style={styles.instructionBox}>
-        {[
-          '1. Open phone WiFi settings',
-          '2. Find SMART_LOCK_SETUP_xxxx',
-          '3. Password: 12345678',
-          '4. Come back here after connecting',
-        ].map((text, i) => (
-          <Text key={i} style={styles.instructionText}>{text}</Text>
-        ))}
-      </View>
-
-      {/* Open WiFi Settings Button */}
+      {/* Scan Button */}
       <TouchableOpacity
-        style={styles.wifiSettingsBtn}
-        onPress={() => Linking.openSettings()}>
-        <Text style={styles.wifiSettingsBtnText}>📶  Open WiFi Settings</Text>
+        style={[styles.primaryBtn, scanning && styles.btnDisabled]}
+        onPress={handleScan}
+        disabled={scanning}>
+        {scanning
+          ? <ActivityIndicator color={colors.textWhite} />
+          : <Text style={styles.primaryBtnText}>🔍  Scan for Devices</Text>}
       </TouchableOpacity>
 
-      {/* Connected Button */}
+      {/* Device List */}
+      {wifiList.length > 0 && (
+        <View style={styles.listContainer}>
+          <Text style={styles.listTitle}>
+            Available Devices ({wifiList.length})
+          </Text>
+          {wifiList.map((network, index) => (
+            <TouchableOpacity
+              key={index}
+              style={styles.deviceItem}
+              onPress={() => handleConnect(network.SSID)}
+              disabled={connecting || loadingInfo}>
+              <View style={styles.deviceItemLeft}>
+                <View style={styles.deviceItemIcon}>
+                  <Text style={styles.deviceItemEmoji}>🔐</Text>
+                </View>
+                <View>
+                  <Text style={styles.deviceItemName}>{network.SSID}</Text>
+                  <Text style={styles.deviceItemSub}>
+                    Signal: {network.level} dBm
+                  </Text>
+                </View>
+              </View>
+              {(connecting || loadingInfo) ? (
+                <ActivityIndicator color={colors.primary} />
+              ) : (
+                <Text style={styles.deviceItemArrow}>›</Text>
+              )}
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
+      {/* Manual Option */}
+      <View style={styles.divider}>
+        <View style={styles.dividerLine} />
+        <Text style={styles.dividerText}>ya manually</Text>
+        <View style={styles.dividerLine} />
+      </View>
+
       <TouchableOpacity
-        style={[styles.primaryBtn, loading && styles.btnDisabled]}
-        onPress={handleFetchDeviceInfo}
-        disabled={loading}>
-        {loading
-          ? <ActivityIndicator color={colors.textWhite} />
-          : <Text style={styles.primaryBtnText}>Connected ✓</Text>}
+        style={styles.manualBtn}
+        onPress={async () => {
+          setLoadingInfo(true);
+          try {
+            const info = await getDeviceInfo();
+            setDeviceInfo(info);
+            setStep(STEPS.VERIFY_DEVICE);
+          } catch (e) {
+            Alert.alert(
+              'Failed',
+              'ESP se connect nahi ho paya!\nPehle manually SMART_LOCK_SETUP_ WiFi se connect karo.'
+            );
+          } finally {
+            setLoadingInfo(false);
+          }
+        }}
+        disabled={loadingInfo}>
+        {loadingInfo
+          ? <ActivityIndicator color={colors.primary} />
+          : <Text style={styles.manualBtnText}>
+              Already connected hoon → Continue
+            </Text>}
       </TouchableOpacity>
     </View>
   );
 
-  // ─── Step 2 UI ────────────────────────────────────────────────
+  // ─── Step 2 — Device Info UI ──────────────────────────────────
   const renderStep2 = () => (
     <View style={styles.stepContainer}>
       <Text style={styles.stepIcon}>✅</Text>
@@ -104,7 +204,15 @@ export default function AddDeviceScreen({ navigation }) {
 
       <View style={styles.deviceInfoBox}>
         <Text style={styles.infoLabel}>Device ID</Text>
-        <Text style={styles.infoValue}>{deviceInfo?.device_id}</Text>
+        <Text style={styles.infoValue}>
+          {deviceInfo?.device_id || 'Unknown'}
+        </Text>
+        {deviceInfo?.firmware && (
+          <>
+            <Text style={[styles.infoLabel, { marginTop: 8 }]}>Firmware</Text>
+            <Text style={styles.infoValue}>{deviceInfo.firmware}</Text>
+          </>
+        )}
       </View>
 
       <Text style={styles.label}>Device Name</Text>
@@ -134,7 +242,10 @@ export default function AddDeviceScreen({ navigation }) {
 
       <TouchableOpacity
         style={styles.backBtn}
-        onPress={() => setStep(STEPS.CONNECT_HOTSPOT)}>
+        onPress={() => {
+          setStep(STEPS.SCAN_DEVICES);
+          setDeviceInfo(null);
+        }}>
         <Text style={styles.backBtnText}>← Go Back</Text>
       </TouchableOpacity>
     </View>
@@ -146,12 +257,18 @@ export default function AddDeviceScreen({ navigation }) {
       {[1, 2].map((s) => (
         <View key={s} style={styles.stepIndicatorRow}>
           <View style={[styles.stepDot, step >= s && styles.stepDotActive]}>
-            <Text style={[styles.stepDotText, step >= s && styles.stepDotTextActive]}>
+            <Text style={[
+              styles.stepDotText,
+              step >= s && styles.stepDotTextActive,
+            ]}>
               {s}
             </Text>
           </View>
           {s < 2 && (
-            <View style={[styles.stepLine, step > s && styles.stepLineActive]} />
+            <View style={[
+              styles.stepLine,
+              step > s && styles.stepLineActive,
+            ]} />
           )}
         </View>
       ))}
@@ -159,10 +276,12 @@ export default function AddDeviceScreen({ navigation }) {
   );
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={styles.content}>
       {renderStepIndicator()}
-      {step === STEPS.CONNECT_HOTSPOT && renderStep1()}
-      {step === STEPS.VERIFY_DEVICE   && renderStep2()}
+      {step === STEPS.SCAN_DEVICES  && renderStep1()}
+      {step === STEPS.VERIFY_DEVICE && renderStep2()}
     </ScrollView>
   );
 }
@@ -193,8 +312,8 @@ const styles = StyleSheet.create({
 
   // Step Container
   stepContainer: {
-    backgroundColor: colors.surface, borderRadius: 20,
-    padding: 24, elevation: 2,
+    backgroundColor: colors.surface,
+    borderRadius: 20, padding: 24, elevation: 2,
   },
   stepIcon: { fontSize: 56, textAlign: 'center', marginBottom: 12 },
   stepTitle: {
@@ -207,15 +326,48 @@ const styles = StyleSheet.create({
   },
   highlight: { color: colors.primary, fontWeight: '700' },
 
-  // Instruction Box
-  instructionBox: {
-    backgroundColor: colors.background, borderRadius: 12,
-    padding: 16, marginBottom: 16,
+  // Device List
+  listContainer: {
+    marginTop: 20, backgroundColor: colors.background,
+    borderRadius: 12, overflow: 'hidden',
   },
-  instructionText: {
-    ...typography.bodyMedium, color: colors.textPrimary,
-    marginBottom: 8, lineHeight: 22,
+  listTitle: {
+    ...typography.label, color: colors.textSecondary,
+    padding: 12, paddingBottom: 8,
   },
+  deviceItem: {
+    flexDirection: 'row', alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 14, borderTopWidth: 1,
+    borderTopColor: colors.divider,
+    backgroundColor: colors.surface,
+  },
+  deviceItemLeft: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  deviceItemIcon: {
+    width: 44, height: 44, borderRadius: 12,
+    backgroundColor: colors.primary + '15',
+    justifyContent: 'center', alignItems: 'center',
+  },
+  deviceItemEmoji: { fontSize: 22 },
+  deviceItemName: { ...typography.h4, color: colors.textPrimary },
+  deviceItemSub: { ...typography.caption, color: colors.textSecondary, marginTop: 2 },
+  deviceItemArrow: { fontSize: 28, color: colors.textLight },
+
+  // Divider
+  divider: {
+    flexDirection: 'row', alignItems: 'center', marginVertical: 20,
+  },
+  dividerLine: { flex: 1, height: 1, backgroundColor: colors.border },
+  dividerText: {
+    ...typography.caption, color: colors.textLight, marginHorizontal: 10,
+  },
+
+  // Manual Button
+  manualBtn: {
+    borderWidth: 1.5, borderColor: colors.primary,
+    borderRadius: 12, padding: 14, alignItems: 'center',
+  },
+  manualBtnText: { ...typography.btnMedium, color: colors.primary },
 
   // Device Info Box
   deviceInfoBox: {
@@ -236,26 +388,13 @@ const styles = StyleSheet.create({
     backgroundColor: colors.background,
   },
 
-  // WiFi Settings Button
-  wifiSettingsBtn: {
-    backgroundColor: colors.primary + '15',
-    borderRadius: 12, padding: 16,
-    alignItems: 'center', marginBottom: 12,
-    borderWidth: 1.5, borderColor: colors.primary,
-  },
-  wifiSettingsBtnText: {
-    ...typography.btnMedium, color: colors.primary,
-  },
-
-  // Primary Button
+  // Buttons
   primaryBtn: {
     backgroundColor: colors.primary, borderRadius: 12,
-    padding: 16, alignItems: 'center', marginTop: 8,
+    padding: 16, alignItems: 'center', marginTop: 24,
   },
   btnDisabled: { backgroundColor: colors.unlockBtnDisabled },
   primaryBtnText: { ...typography.btnLarge, color: colors.textWhite },
-
-  // Back Button
   backBtn: { alignItems: 'center', marginTop: 16 },
   backBtnText: { ...typography.bodyMedium, color: colors.textSecondary },
 });
